@@ -12,6 +12,9 @@ A Stacks blockchain smart contract that automates microloan distribution and rep
 - **Reputation System**: Borrower credit scoring based on payment history
 - **Overdue Management**: Automatic marking of overdue loans
 - **Emergency Controls**: Pause/resume loans when needed
+- **🔐 Collateral Management**: Secure STX-backed loans with automated liquidation
+- **⚡ Liquidation Engine**: Automatic position liquidation when collateral ratios drop
+- **💎 Escrow System**: Smart contract-managed collateral with partial release
 
 ## Contract Constants
 
@@ -20,6 +23,9 @@ A Stacks blockchain smart contract that automates microloan distribution and rep
 - **Minimum Loan**: 1 STX
 - **Maximum Loan**: 50 STX
 - **Minimum Reputation**: 300 (out of 1000)
+- **🔒 Minimum Collateral Ratio**: 150%
+- **⚠️ Liquidation Threshold**: 120%
+- **💰 Liquidation Penalty**: 10%
 
 ## Usage
 
@@ -36,8 +42,14 @@ A Stacks blockchain smart contract that automates microloan distribution and rep
 ;; Apply for a loan
 (contract-call? .Loandisburse apply-for-loan u2000000 "Small business inventory")
 
-;; Make loan payment
-(contract-call? .Loandisburse make-payment u1 u500000) ;; Pay 0.5 STX toward loan #1
+;; After approval, deposit collateral (>= 150% of loan principal)
+(contract-call? .Loandisburse deposit-collateral u1 u3000000)
+
+;; Disbursement by owner, then make payments
+(contract-call? .Loandisburse make-payment u1 u500000)
+
+;; Withdraw surplus collateral while maintaining required ratio
+(contract-call? .Loandisburse withdraw-collateral u1 u100000)
 ```
 
 ### For Contract Owner
@@ -51,6 +63,16 @@ A Stacks blockchain smart contract that automates microloan distribution and rep
 
 ;; Mark overdue loans
 (contract-call? .Loandisburse mark-loan-overdue u1)
+```
+
+### For Liquidators
+
+```clarity
+;; Check if position can be liquidated (anyone can call)
+(contract-call? .Loandisburse check-liquidation-risk u1)
+
+;; Liquidate under-collateralized position and earn rewards
+(contract-call? .Loandisburse liquidate-position u1)
 ```
 
 ### Read-Only Functions
@@ -70,6 +92,18 @@ A Stacks blockchain smart contract that automates microloan distribution and rep
 
 ;; Get payment schedule
 (contract-call? .Loandisburse get-payment-schedule u1)
+
+;; Check collateral position
+(contract-call? .Loandisburse get-collateral-position u1)
+
+;; Check liquidation risk and ratios
+(contract-call? .Loandisburse check-liquidation-risk u1)
+
+;; Get liquidation information and rewards
+(contract-call? .Loandisburse get-liquidation-info u1)
+
+;; Calculate required collateral for loan amount
+(contract-call? .Loandisburse calculate-required-collateral u2000000)
 ```
 
 ## Loan Process Flow
@@ -77,10 +111,12 @@ A Stacks blockchain smart contract that automates microloan distribution and rep
 1. **Lenders** contribute STX to the pool
 2. **Borrowers** apply for loans with amount and purpose
 3. **Contract Owner** approves qualified applications
-4. **Contract Owner** disburses approved loans to borrowers
-5. **Borrowers** make payments over time
-6. **System** automatically tracks repayments and updates reputation scores
-7. **Repaid funds** return to the pool for new loans
+4. **Borrowers** deposit collateral (≥150% of loan principal)
+5. **Contract Owner** disburses approved loans to borrowers
+6. **Borrowers** make payments over time
+7. **System** automatically releases collateral proportionally to repayments
+8. **Liquidators** can liquidate under-collateralized positions (<120% ratio)
+9. **Repaid funds** and liquidated collateral return to the pool for new loans
 
 ## Security Features
 
@@ -89,6 +125,10 @@ A Stacks blockchain smart contract that automates microloan distribution and rep
 - Reserve fund management (20% pool reserve)
 - Overdue loan tracking and penalties
 - Emergency pause/resume functionality
+- **🔐 Collateral Escrow Protection**: Smart contract-managed STX collateral
+- **⚡ Automatic Liquidation**: Permissionless liquidation of risky positions
+- **💎 Graduated Collateral Release**: Automatic release tied to repayment progress
+- **🛡️ Over-Collateralization**: 150% minimum collateral requirement
 
 ## Deployment
 
@@ -111,3 +151,7 @@ clarinet deploy --testnet
 - `106`: Payment too small
 - `107`: Already approved
 - `108`: Not approved
+- `109`: Insufficient collateral
+- `110`: Liquidation not allowed
+- `111`: Excess collateral withdrawal
+- `112`: Liquidation threshold reached

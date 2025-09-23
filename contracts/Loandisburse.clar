@@ -9,17 +9,26 @@
 (define-constant ERR_PAYMENT_TOO_SMALL (err u106))
 (define-constant ERR_ALREADY_APPROVED (err u107))
 (define-constant ERR_NOT_APPROVED (err u108))
+(define-constant ERR_INSUFFICIENT_COLLATERAL (err u109))
+(define-constant ERR_LIQUIDATION_NOT_ALLOWED (err u110))
+(define-constant ERR_EXCESS_COLLATERAL_WITHDRAWAL (err u111))
+(define-constant ERR_LIQUIDATION_THRESHOLD_REACHED (err u112))
 
 (define-constant CONTRACT_OWNER tx-sender)
 (define-constant INTEREST_RATE u10)
 (define-constant LOAN_DURATION u2160)
 (define-constant MIN_LOAN_AMOUNT u1000000)
 (define-constant MAX_LOAN_AMOUNT u50000000)
+(define-constant MIN_COLLATERAL_RATIO u150)
+(define-constant LIQUIDATION_THRESHOLD u120)
+(define-constant LIQUIDATION_PENALTY u10)
 
 (define-data-var total-pool uint u0)
 (define-data-var next-loan-id uint u1)
 (define-data-var total-loans-disbursed uint u0)
 (define-data-var total-repaid uint u0)
+(define-data-var total-collateral-locked uint u0)
+(define-data-var total-liquidations uint u0)
 
 (define-map loans
   { loan-id: uint }
@@ -66,6 +75,18 @@
   }
 )
 
+(define-map collateral-positions
+  { loan-id: uint }
+  {
+    borrower: principal,
+    stx-locked: uint,
+    collateral-ratio: uint,
+    liquidation-price: uint,
+    locked-at: uint,
+    is-liquidated: bool
+  }
+)
+
 (define-public (contribute-to-pool (amount uint))
   (begin
     (asserts! (> amount u0) ERR_INVALID_AMOUNT)
@@ -85,6 +106,72 @@
       )
     )
     (ok amount)
+  )
+)
+
+(define-public (deposit-collateral (loan-id uint) (collateral-amount uint))
+  (let 
+    (
+      (loan (unwrap! (map-get? loans { loan-id: loan-id }) ERR_LOAN_NOT_FOUND))
+      (borrower (get borrower loan))
+      (loan-amount (get amount loan))
+      (required-collateral (/ (* loan-amount MIN_COLLATERAL_RATIO) u100))
+    )
+    (asserts! (is-eq tx-sender borrower) ERR_UNAUTHORIZED)
+    (asserts! (>= collateral-amount required-collateral) ERR_INSUFFICIENT_COLLATERAL)
+    (asserts! (is-eq (get status loan) "active") ERR_LOAN_NOT_FOUND)
+    (asserts! (> collateral-amount u0) ERR_INVALID_AMOUNT)
+    
+    (try! (stx-transfer? collateral-amount tx-sender (as-contract tx-sender)))
+    (var-set total-collateral-locked (+ (var-get total-collateral-locked) collateral-amount))
+    
+    (let ((collateral-ratio (/ (* collateral-amount u100) loan-amount)))
+      (map-set collateral-positions
+        { loan-id: loan-id }
+        {
+          borrower: borrower,
+          stx-locked: collateral-amount,
+          collateral-ratio: collateral-ratio,
+          liquidation-price: (/ (* loan-amount LIQUIDATION_THRESHOLD) u100),
+          locked-at: stacks-block-height,
+          is-liquidated: false
+        }
+      )
+    )
+    (ok collateral-amount)
+  )
+)
+
+(define-public (withdraw-collateral (loan-id uint) (withdrawal-amount uint))
+  (let 
+    (
+      (loan (unwrap! (map-get? loans { loan-id: loan-id }) ERR_LOAN_NOT_FOUND))
+      (collateral-pos (unwrap! (map-get? collateral-positions { loan-id: loan-id }) ERR_LOAN_NOT_FOUND))
+      (borrower (get borrower loan))
+      (loan-amount (get amount loan))
+      (amount-repaid (get amount-repaid loan))
+      (outstanding-debt (- (get total-due loan) amount-repaid))
+      (current-collateral (get stx-locked collateral-pos))
+      (remaining-collateral (- current-collateral withdrawal-amount))
+      (new-ratio (if (> outstanding-debt u0) (/ (* remaining-collateral u100) outstanding-debt) u0))
+    )
+    (asserts! (is-eq tx-sender borrower) ERR_UNAUTHORIZED)
+    (asserts! (> withdrawal-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (<= withdrawal-amount current-collateral) ERR_INSUFFICIENT_FUNDS)
+    (asserts! (not (get is-liquidated collateral-pos)) ERR_LIQUIDATION_NOT_ALLOWED)
+    (asserts! (or (is-eq outstanding-debt u0) (>= new-ratio MIN_COLLATERAL_RATIO)) ERR_EXCESS_COLLATERAL_WITHDRAWAL)
+    
+    (try! (as-contract (stx-transfer? withdrawal-amount tx-sender borrower)))
+    (var-set total-collateral-locked (- (var-get total-collateral-locked) withdrawal-amount))
+    
+    (map-set collateral-positions
+      { loan-id: loan-id }
+      (merge collateral-pos {
+        stx-locked: remaining-collateral,
+        collateral-ratio: new-ratio
+      })
+    )
+    (ok withdrawal-amount)
   )
 )
 
@@ -212,6 +299,25 @@
       
       (if (is-eq final-status "repaid")
         (begin
+          (match (map-get? collateral-positions { loan-id: loan-id })
+            collateral-pos
+            (begin
+              (let ((locked-collateral (get stx-locked collateral-pos)))
+                (if (> locked-collateral u0)
+                  (begin
+                    (try! (as-contract (stx-transfer? locked-collateral tx-sender borrower)))
+                    (var-set total-collateral-locked (- (var-get total-collateral-locked) locked-collateral))
+                    (map-set collateral-positions
+                      { loan-id: loan-id }
+                      (merge collateral-pos { stx-locked: u0 })
+                    )
+                  )
+                  true
+                )
+              )
+            )
+            true
+          )
           (map-set borrower-stats
             { borrower: borrower }
             (merge 
@@ -231,6 +337,61 @@
         (ok new-repaid)
       )
     )
+  )
+)
+
+(define-public (liquidate-position (loan-id uint))
+  (let 
+    (
+      (loan (unwrap! (map-get? loans { loan-id: loan-id }) ERR_LOAN_NOT_FOUND))
+      (collateral-pos (unwrap! (map-get? collateral-positions { loan-id: loan-id }) ERR_LOAN_NOT_FOUND))
+      (borrower (get borrower loan))
+      (outstanding-debt (- (get total-due loan) (get amount-repaid loan)))
+      (collateral-amount (get stx-locked collateral-pos))
+      (current-ratio (if (> outstanding-debt u0) (/ (* collateral-amount u100) outstanding-debt) u0))
+      (penalty-amount (/ (* collateral-amount LIQUIDATION_PENALTY) u100))
+      (liquidator-reward (/ penalty-amount u2))
+      (protocol-share (- penalty-amount liquidator-reward))
+      (remaining-collateral (- collateral-amount penalty-amount))
+    )
+    (asserts! (< current-ratio LIQUIDATION_THRESHOLD) ERR_LIQUIDATION_NOT_ALLOWED)
+    (asserts! (not (get is-liquidated collateral-pos)) ERR_LIQUIDATION_NOT_ALLOWED)
+    (asserts! (not (is-eq (get status loan) "repaid")) ERR_LOAN_NOT_FOUND)
+    
+    (try! (as-contract (stx-transfer? liquidator-reward tx-sender tx-sender)))
+    (try! (as-contract (stx-transfer? remaining-collateral tx-sender (as-contract tx-sender))))
+    
+    (var-set total-pool (+ (var-get total-pool) remaining-collateral))
+    (var-set total-collateral-locked (- (var-get total-collateral-locked) collateral-amount))
+    (var-set total-liquidations (+ (var-get total-liquidations) u1))
+    
+    (map-set loans
+      { loan-id: loan-id }
+      (merge loan { status: "liquidated" })
+    )
+    
+    (map-set collateral-positions
+      { loan-id: loan-id }
+      (merge collateral-pos {
+        is-liquidated: true,
+        stx-locked: u0
+      })
+    )
+    
+    (map-set borrower-stats
+      { borrower: borrower }
+      (merge 
+        (default-to 
+          { total-loans: u0, total-repaid: u0, current-loans: u0, reputation-score: u100 }
+          (map-get? borrower-stats { borrower: borrower })
+        )
+        { 
+          reputation-score: (if (> (get reputation-score (default-to { total-loans: u0, total-repaid: u0, current-loans: u0, reputation-score: u100 } (map-get? borrower-stats { borrower: borrower }))) u50) (- (get reputation-score (default-to { total-loans: u0, total-repaid: u0, current-loans: u0, reputation-score: u100 } (map-get? borrower-stats { borrower: borrower }))) u50) u0),
+          current-loans: (- (get current-loans (default-to { total-loans: u0, total-repaid: u0, current-loans: u0, reputation-score: u100 } (map-get? borrower-stats { borrower: borrower }))) u1)
+        }
+      )
+    )
+    (ok loan-id)
   )
 )
 
@@ -356,7 +517,9 @@
     total-pool: (var-get total-pool),
     total-loans-disbursed: (var-get total-loans-disbursed),
     total-repaid: (var-get total-repaid),
-    next-loan-id: (var-get next-loan-id)
+    next-loan-id: (var-get next-loan-id),
+    total-collateral-locked: (var-get total-collateral-locked),
+    total-liquidations: (var-get total-liquidations)
   })
 )
 
@@ -459,6 +622,79 @@
   )
 )
 
+(define-read-only (get-collateral-position (loan-id uint))
+  (ok (map-get? collateral-positions { loan-id: loan-id }))
+)
+
+(define-read-only (check-liquidation-risk (loan-id uint))
+  (match (map-get? loans { loan-id: loan-id })
+    loan-data
+      (match (map-get? collateral-positions { loan-id: loan-id })
+        collateral-pos
+          (let 
+            (
+              (outstanding-debt (- (get total-due loan-data) (get amount-repaid loan-data)))
+              (collateral-amount (get stx-locked collateral-pos))
+              (current-ratio (if (> outstanding-debt u0) (/ (* collateral-amount u100) outstanding-debt) u0))
+            )
+            (ok {
+              current-ratio: current-ratio,
+              liquidation-threshold: LIQUIDATION_THRESHOLD,
+              at-risk: (< current-ratio LIQUIDATION_THRESHOLD),
+              collateral-locked: collateral-amount,
+              outstanding-debt: outstanding-debt
+            })
+          )
+        (ok {
+          current-ratio: u0,
+          liquidation-threshold: LIQUIDATION_THRESHOLD,
+          at-risk: false,
+          collateral-locked: u0,
+          outstanding-debt: u0
+        })
+      )
+    (err ERR_LOAN_NOT_FOUND)
+  )
+)
+
+(define-read-only (calculate-required-collateral (loan-amount uint))
+  (ok (/ (* loan-amount MIN_COLLATERAL_RATIO) u100))
+)
+
+(define-read-only (get-liquidation-info (loan-id uint))
+  (match (map-get? loans { loan-id: loan-id })
+    loan-data
+      (match (map-get? collateral-positions { loan-id: loan-id })
+        collateral-pos
+          (let 
+            (
+              (outstanding-debt (- (get total-due loan-data) (get amount-repaid loan-data)))
+              (collateral-amount (get stx-locked collateral-pos))
+              (penalty-amount (/ (* collateral-amount LIQUIDATION_PENALTY) u100))
+              (liquidator-reward (/ penalty-amount u2))
+            )
+            (ok {
+              can-liquidate: (and 
+                            (< (if (> outstanding-debt u0) (/ (* collateral-amount u100) outstanding-debt) u0) LIQUIDATION_THRESHOLD)
+                            (not (get is-liquidated collateral-pos))
+                            (not (is-eq (get status loan-data) "repaid"))
+                          ),
+              liquidator-reward: liquidator-reward,
+              penalty-amount: penalty-amount,
+              collateral-at-risk: collateral-amount
+            })
+          )
+        (ok {
+          can-liquidate: false,
+          liquidator-reward: u0,
+          penalty-amount: u0,
+          collateral-at-risk: u0
+        })
+      )
+    (err ERR_LOAN_NOT_FOUND)
+  )
+)
+
 (define-read-only (get-loan-eligibility (applicant principal) (amount uint))
   (let 
     (
@@ -469,6 +705,7 @@
       (reputation (get reputation-score stats))
       (current-loans (get current-loans stats))
       (available-funds (unwrap-panic (get-available-funds)))
+      (required-collateral (/ (* amount MIN_COLLATERAL_RATIO) u100))
     )
     (ok {
       eligible: (and 
@@ -481,7 +718,8 @@
       min-reputation-required: u300,
       current-reputation: reputation,
       max-loan-amount: (if (< available-funds MAX_LOAN_AMOUNT) available-funds MAX_LOAN_AMOUNT),
-      current-loans: current-loans
+      current-loans: current-loans,
+      required-collateral: required-collateral
     })
   )
 )
